@@ -6,6 +6,12 @@ import type { ObserverPaths } from "./paths.js";
 import { isMissingPathError, toError } from "./paths.js";
 
 const MAX_TRACKED_ENTRIES = 250_000;
+// fs.stat runs on the libuv threadpool, which is four threads and shared by the
+// whole daemon. One stat per native event pins it and unrelated filesystem work
+// stalls. Beyond the queue bound, fall back to a directory scan, which finds the
+// same paths at a fraction of the cost.
+const MAX_CONCURRENT_CLASSIFICATIONS = 32;
+const MAX_QUEUED_CLASSIFICATIONS = 2_048;
 const AUDIT_QUIET_MS = 500;
 const AUDIT_MAX_DIRTY_MS = 5_000;
 const OPTIONAL_AUDIT_QUIET_MS = 8_000;
@@ -50,6 +56,10 @@ class NativeRecursiveBackend implements ObservationBackend {
   private directories = new Set<string>();
   private entries = new Map<string, DirectoryEntry>();
   private readonly classifications = new Set<Promise<void>>();
+  private readonly classificationQueue: Array<{
+    path: string;
+    onPresent: (isDirectory: boolean) => void;
+  }> = [];
   private readonly localScopes = new Set<string>();
   private readonly changeScopes = new Set<string>();
   private readonly recursiveScopes = new Set<string>();
@@ -110,14 +120,17 @@ class NativeRecursiveBackend implements ObservationBackend {
         this.changeScopes.size +
         this.recursiveScopes.size +
         this.classifications.size +
+        this.classificationQueue.length +
         this.queueDepth +
         Number(this.auditTimer !== null || this.auditQueued || this.auditDirty),
+      pendingClassificationCount: this.classifications.size + this.classificationQueue.length,
       reconciliationInFlight: this.inFlight,
     };
   }
 
   private async finishClose(): Promise<void> {
     await this.reconcileTail;
+    this.classificationQueue.length = 0;
     await Promise.allSettled(this.classifications);
     this.watcher?.close();
     this.watcher = null;
@@ -578,6 +591,28 @@ class NativeRecursiveBackend implements ObservationBackend {
   }
 
   private classify(path: string, onPresent: (isDirectory: boolean) => void): void {
+    if (this.classificationQueue.length >= MAX_QUEUED_CLASSIFICATIONS) {
+      // Shed load onto the scoped audit, which reads the directory once instead
+      // of stat-ing every entry in it.
+      this.requestAudit(dirname(path));
+      return;
+    }
+    this.classificationQueue.push({ path, onPresent });
+    this.pumpClassifications();
+  }
+
+  private pumpClassifications(): void {
+    while (
+      this.classifications.size < MAX_CONCURRENT_CLASSIFICATIONS &&
+      this.classificationQueue.length > 0
+    ) {
+      const next = this.classificationQueue.shift();
+      if (!next) return;
+      this.startClassification(next.path, next.onPresent);
+    }
+  }
+
+  private startClassification(path: string, onPresent: (isDirectory: boolean) => void): void {
     this.host.metrics.nativeClassificationCount += 1;
     let classification!: Promise<void>;
     classification = stat(path)
@@ -593,7 +628,10 @@ class NativeRecursiveBackend implements ObservationBackend {
         }
         this.host.fail(toError(error));
       })
-      .finally(() => this.classifications.delete(classification));
+      .finally(() => {
+        this.classifications.delete(classification);
+        if (this.host.isActive()) this.pumpClassifications();
+      });
     this.classifications.add(classification);
   }
 
