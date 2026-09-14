@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve, sep } from "node:path";
 import { LRUCache } from "lru-cache";
 import { CheckoutDiffCache } from "./checkout-diff-cache.js";
 import pLimit from "p-limit";
@@ -45,7 +45,9 @@ import { parseGitRevParsePath } from "../utils/git-rev-parse-path.js";
 import {
   createRealpathAwarePathMatcher,
   getRealpathAwareRelativePath,
+  isPathInsideRoot,
   isRealpathInsideRoot,
+  looksLikeDefiniteWindowsPath,
 } from "../utils/path.js";
 import {
   createRunGitCommand,
@@ -84,6 +86,10 @@ const FORGE_PR_STATUS_POLL_FAST_INTERVAL_MS = 20_000;
 const FORGE_PR_STATUS_POLL_SLOW_INTERVAL_MS = 120_000;
 const FORGE_PR_STATUS_POLL_ERROR_BACKOFF_CAP_MS = 300_000;
 const DEGRADED_GIT_POLL_INTERVAL_MS = 5_000;
+// A dependency install creates directories for minutes. Collapse the burst into
+// a couple of `git ls-files` runs rather than one per event.
+const WORKING_TREE_IGNORE_REFRESH_QUIET_MS = 300;
+const WORKING_TREE_IGNORE_REFRESH_MAX_DELAY_MS = 2_000;
 // Keep whole workspace pipelines below the lower-level Git process pool so daemon control work
 // retains subprocess and event-loop headroom during large workspace reconciliation bursts.
 export const WORKSPACE_GIT_REFRESH_CONCURRENCY = 4;
@@ -444,8 +450,19 @@ interface WorkingTreeWatchTarget {
   repoRoot: string | null;
   subscription: FileObserverSubscription | null;
   ignoredDirectories: Set<string>;
+  // What the live subscription actually accepted, as of the last successful
+  // `updateIgnore`/subscribe — the full resolved ignore list (the watch root's
+  // `.git` plus gitignore-derived `ignoredDirectories`), not just
+  // `ignoredDirectories`. The resolved list can move ahead of this (a fresh
+  // `git ls-files` result) while the subscription still runs on the old set;
+  // comparing against this field instead of the last-computed value keeps a
+  // skipped update from latching forever.
+  appliedIgnoreList: string[];
   ignoredDirectoriesRefreshPromise: Promise<void> | null;
   ignoredDirectoriesRefreshRequested: boolean;
+  knownDirectories: Set<string>;
+  ignoreRefreshTimer: NodeJS.Timeout | null;
+  ignoreRefreshDeadlineMs: number | null;
   aliases: Set<string>;
   workspaceKeys: Set<string>;
   fallbackPolling: boolean;
@@ -1281,8 +1298,12 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       repoRoot,
       subscription: null,
       ignoredDirectories,
+      appliedIgnoreList: [],
       ignoredDirectoriesRefreshPromise: null,
       ignoredDirectoriesRefreshRequested: false,
+      knownDirectories: new Set(),
+      ignoreRefreshTimer: null,
+      ignoreRefreshDeadlineMs: null,
       aliases: new Set([cwd]),
       workspaceKeys: new Set(),
       fallbackPolling: false,
@@ -1390,11 +1411,18 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
   }
 
+  // Shared by startWorkingTreeSubscription and
+  // replaceWorkingTreeIgnoredDirectories's applied-vs-desired gate so both
+  // compute the same resolved ignore list.
+  private workingTreeIgnoreList(target: WorkingTreeWatchTarget): string[] {
+    return [join(target.watchPath, ".git"), ...target.ignoredDirectories];
+  }
+
   private async startWorkingTreeSubscription(
     target: WorkingTreeWatchTarget,
     options?: { replaceFallback?: boolean },
   ): Promise<boolean> {
-    const ignore = [join(target.watchPath, ".git"), ...target.ignoredDirectories];
+    const ignore = this.workingTreeIgnoreList(target);
     let watcherErrored = false;
     let subscribeSettled = false;
     const markSubscribeSettled = () => {
@@ -1426,8 +1454,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
           if (watcherErrored) {
             return;
           }
+          const discovered = this.noteWorkingTreeDirectories(target, events);
           if (events.some((event) => basename(event.path) === ".gitignore")) {
             void this.refreshWorkingTreeIgnoredDirectories(target);
+          } else if (discovered) {
+            this.scheduleWorkingTreeIgnoreRefresh(target);
           }
           if (!this.hasRelevantWorkingTreeEvent(target, events)) {
             return;
@@ -1450,6 +1481,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         return false;
       }
       target.subscription = subscription;
+      target.appliedIgnoreList = ignore;
       if (options?.replaceFallback && target.repoRoot !== null) {
         target.fallbackPolling = false;
         if (target.fallbackPollTimer) {
@@ -1592,6 +1624,129 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     await this.refreshWorkingTreeIgnoredDirectories(target);
   }
 
+  /**
+   * `git ls-files` reports ignored directories only once they exist, so the
+   * ignore set must be re-read when new directory topology appears — not only
+   * when the rules change. Keyed on `dirname` because FSEvents coalescing makes
+   * the directory's own creation event unreliable; a file inside it proves it
+   * exists either way.
+   */
+  private noteWorkingTreeDirectories(
+    target: WorkingTreeWatchTarget,
+    events: FileChange[],
+  ): boolean {
+    if (target.repoRoot === null) {
+      return false;
+    }
+    const gitDir = join(target.watchPath, ".git");
+    // `matchesWatchPath` is realpath-aware because it compares an event-reported
+    // directory against `target.watchPath` itself — a config-time root that can
+    // legitimately differ from the watcher's reported form (e.g. a symlinked
+    // temp dir). It is now gated behind the plain Set lookup below, so it only
+    // runs for a directory this target has never seen before, not on every
+    // event.
+    const matchesWatchPath = createRealpathAwarePathMatcher(target.watchPath);
+    let discovered = false;
+    // Dedup per batch: a burst of thousands of events in one directory must
+    // pay this cost once, not once per event.
+    const directories = new Set(events.map((event) => dirname(event.path)));
+    for (const directory of directories) {
+      // Cheap Set lookup first — the steady-state case where the directory is
+      // already known must never reach the realpath-aware matcher below.
+      if (target.knownDirectories.has(directory) || matchesWatchPath(directory)) {
+        continue;
+      }
+      // `directory` and `gitDir`/`ignoredDirectory` all derive from the same
+      // `target.watchPath` used to build this subscription, and `directory`
+      // itself is the same `dirname(event.path)` value already trusted as a
+      // plain string key by `target.knownDirectories.has()` above — no realpath
+      // resolution needed for containment among values from this one source.
+      if (!isPathInsideRoot(target.watchPath, directory)) {
+        continue;
+      }
+      if (isPathInsideRoot(gitDir, directory)) {
+        continue;
+      }
+      let ignored = false;
+      for (const ignoredDirectory of target.ignoredDirectories) {
+        if (isPathInsideRoot(ignoredDirectory, directory)) {
+          ignored = true;
+          break;
+        }
+      }
+      if (ignored) {
+        continue;
+      }
+      target.knownDirectories.add(directory);
+      discovered = true;
+    }
+    return discovered;
+  }
+
+  private scheduleWorkingTreeIgnoreRefresh(target: WorkingTreeWatchTarget): void {
+    if (this.disposed || target.closed || target.repoRoot === null) {
+      return;
+    }
+    const now = this.deps.now().getTime();
+    target.ignoreRefreshDeadlineMs ??= now + WORKING_TREE_IGNORE_REFRESH_MAX_DELAY_MS;
+    if (target.ignoreRefreshTimer) {
+      clearTimeout(target.ignoreRefreshTimer);
+    }
+    const delayMs = Math.max(
+      0,
+      Math.min(WORKING_TREE_IGNORE_REFRESH_QUIET_MS, target.ignoreRefreshDeadlineMs - now),
+    );
+    target.ignoreRefreshTimer = setTimeout(() => {
+      target.ignoreRefreshTimer = null;
+      target.ignoreRefreshDeadlineMs = null;
+      void this.refreshWorkingTreeIgnoredDirectories(target);
+    }, delayMs);
+  }
+
+  /**
+   * String-prefix containment, not `isRealpathInsideRoot`: every entry on
+   * both sides is a plain path built from `target.watchPath` by this same
+   * class (`dirname(event.path)` for `knownDirectories`, `resolve(watchPath,
+   * ...)` for `ignoredDirectories` in `loadIgnoredDirs`) — no realpath
+   * divergence to reconcile, per the same reasoning as
+   * `noteWorkingTreeDirectories`. Normalizing each ignored root once up front
+   * instead of recomputing per pair turns a 30k-known x 40-ignored scan from
+   * ~26s of synchronous realpath syscalls into a bounded number of cheap
+   * string comparisons.
+   *
+   * Case-folding still needs to happen for a Windows-looking root, same as
+   * `isPathInsideRoot`/`isRealpathInsideRoot` in `../utils/path.js` — a
+   * case-insensitive filesystem can report a known directory whose case
+   * diverges from the git-reported ignored root. Since both sides derive
+   * from the single `target.watchPath` for this target, whether to fold is
+   * one decision for the whole call (`looksLikeDefiniteWindowsPath`
+   * reused from `../utils/path.js`, not reimplemented here), not a per-pair
+   * one — so it costs nothing beyond the already-precomputed prefixes.
+   */
+  private pruneKnownDirectories(target: WorkingTreeWatchTarget): void {
+    if (target.ignoredDirectories.size === 0) {
+      return;
+    }
+    const foldCase = looksLikeDefiniteWindowsPath(target.watchPath);
+    const ignoredPrefixes: string[] = [];
+    const foldedIgnoredExact = foldCase ? new Set<string>() : null;
+    for (const ignoredDirectory of target.ignoredDirectories) {
+      const prefix = `${ignoredDirectory}${sep}`;
+      ignoredPrefixes.push(foldCase ? prefix.toLowerCase() : prefix);
+      foldedIgnoredExact?.add(ignoredDirectory.toLowerCase());
+    }
+    for (const directory of target.knownDirectories) {
+      const comparableDirectory = foldCase ? directory.toLowerCase() : directory;
+      const comparableDirectoryWithSep = `${comparableDirectory}${sep}`;
+      const isIgnored =
+        (foldedIgnoredExact ?? target.ignoredDirectories).has(comparableDirectory) ||
+        ignoredPrefixes.some((prefix) => comparableDirectoryWithSep.startsWith(prefix));
+      if (isIgnored) {
+        target.knownDirectories.delete(directory);
+      }
+    }
+  }
+
   private hasRelevantWorkingTreeEvent(
     target: WorkingTreeWatchTarget,
     events: FileChange[],
@@ -1649,31 +1804,47 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private async replaceWorkingTreeIgnoredDirectories(
     target: WorkingTreeWatchTarget,
   ): Promise<void> {
-    const ignoredDirectories = await this.loadIgnoredDirs(target.watchPath);
-    if (target.closed || this.haveSamePaths(target.ignoredDirectories, ignoredDirectories)) {
+    const ignoredDirectories = await this.loadIgnoredDirs(
+      target.watchPath,
+      target.ignoredDirectories,
+    );
+    if (target.closed) {
       return;
     }
-
-    target.ignoredDirectories = ignoredDirectories;
+    if (!this.haveSamePaths(target.ignoredDirectories, ignoredDirectories)) {
+      target.ignoredDirectories = ignoredDirectories;
+      this.pruneKnownDirectories(target);
+    }
     if (target.fallbackPolling) {
       return;
     }
     const subscription = target.subscription;
-    if (subscription) {
-      try {
-        await subscription.updateIgnore([join(target.watchPath, ".git"), ...ignoredDirectories]);
-      } catch (error) {
-        target.subscription = null;
-        if (!target.closed && !target.fallbackPolling) {
-          this.startWorkingTreeWatchFallback(target, "watcher_update_failed");
-          this.scheduleWorkingTreeWatchRecovery(target);
-        }
-        this.logger.warn(
-          { err: error, cwd: target.cwd },
-          "Failed to update working tree watcher ignore paths",
-        );
-        return;
+    if (!subscription) {
+      return;
+    }
+    // Compare against the resolved list the live subscription actually
+    // accepted (`appliedIgnoreList`), not what git last reported
+    // (`ignoredDirectories` alone) — the comparison and the value passed to
+    // `updateIgnore` have to be the same array, or a skipped update would
+    // otherwise latch forever.
+    const next = this.workingTreeIgnoreList(target);
+    if (this.haveSamePaths(new Set(target.appliedIgnoreList), new Set(next))) {
+      return;
+    }
+    try {
+      await subscription.updateIgnore(next);
+      target.appliedIgnoreList = next;
+    } catch (error) {
+      target.subscription = null;
+      if (!target.closed && !target.fallbackPolling) {
+        this.startWorkingTreeWatchFallback(target, "watcher_update_failed");
+        this.scheduleWorkingTreeWatchRecovery(target);
       }
+      this.logger.warn(
+        { err: error, cwd: target.cwd },
+        "Failed to update working tree watcher ignore paths",
+      );
+      return;
     }
     if (target.closed || target.fallbackPolling) {
       return;
@@ -2570,7 +2741,22 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     target.forgePrStatusPollKey = null;
   }
 
-  private async loadIgnoredDirs(rootPath: string): Promise<Set<string>> {
+  /**
+   * `previous` is what the caller should get back on failure. `runGitCommand`
+   * rejects on any non-zero exit or timeout, and a timeout is plausible under
+   * exactly the churn storm this ignore-refresh path targets. Returning an
+   * empty set on failure would read to the caller as "nothing is ignored" —
+   * indistinguishable from a real, freshly-computed empty result — and
+   * `replaceWorkingTreeIgnoredDirectories` treats its return value as
+   * authoritative, replacing `target.ignoredDirectories` and re-ingesting
+   * every directory that was previously ignored. Returning the previous set
+   * instead means a failed refresh leaves the watcher's ignore state
+   * unchanged rather than un-ignoring the entire dependency tree.
+   */
+  private async loadIgnoredDirs(
+    rootPath: string,
+    previous: Set<string> = new Set(),
+  ): Promise<Set<string>> {
     const ignored = new Set<string>();
     try {
       const result = await this.deps.runGitCommand(
@@ -2588,10 +2774,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         ignored.add(resolve(rootPath, rel));
       }
     } catch (error) {
-      this.logger.debug(
+      this.logger.warn(
         { err: error, rootPath },
-        "Failed to load gitignore directories; falling back to name-based skip only",
+        "Failed to load gitignore directories; keeping previous ignore set",
       );
+      return previous;
     }
 
     return ignored;
@@ -3332,6 +3519,11 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       clearTimeout(target.recovery.timer);
       target.recovery.timer = null;
     }
+    if (target.ignoreRefreshTimer) {
+      clearTimeout(target.ignoreRefreshTimer);
+      target.ignoreRefreshTimer = null;
+    }
+    target.ignoreRefreshDeadlineMs = null;
 
     if (target.subscription) {
       const subscription = target.subscription;

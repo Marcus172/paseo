@@ -1982,6 +1982,141 @@ describe("WorkspaceGitService checkout observation", () => {
     service.dispose();
   });
 
+  test("pruneKnownDirectories case-folds a Windows-shaped watch root", () => {
+    // `pruneKnownDirectories` only needs to fold case when the watch root
+    // *looks* like a Windows path (drive letter or UNC) — see
+    // `looksLikeDefiniteWindowsPath` in `../utils/path.js`, the same rule
+    // `isPathInsideRoot`/`isRealpathInsideRoot` used before this method was
+    // rewritten from realpath comparisons to string prefixes (see the
+    // class-level comment on `pruneKnownDirectories`). macOS's real
+    // filesystem is already case-insensitive, so a test built from real
+    // directories on disk would pass whether or not that fold logic
+    // exists — a synthetic Windows-shaped root exercises the comparison
+    // logic itself instead of relying on host filesystem behavior.
+    //
+    // Driven directly against the private target rather than through
+    // `registerWorkspace`, because `registerWorkspace` runs `cwd` through
+    // `node:path`'s `resolve()`, which on this POSIX test host rewrites a
+    // drive-letter path into an ordinary POSIX one and destroys the shape
+    // this test depends on.
+    const service = createService(createWatcherHarness());
+    const target = {
+      watchPath: "C:/Users/dev/Repo",
+      knownDirectories: new Set<string>(["C:/Users/dev/Repo/Deps/package-a"]),
+      ignoredDirectories: new Set<string>(["C:/Users/dev/Repo/deps"]),
+    };
+
+    (
+      service as unknown as { pruneKnownDirectories: (t: typeof target) => void }
+    ).pruneKnownDirectories(target);
+
+    expect(target.knownDirectories.has("C:/Users/dev/Repo/Deps/package-a")).toBe(false);
+
+    service.dispose();
+  });
+
+  test("a previously unseen directory refreshes the ignore set", async () => {
+    const watcher = createWatcherHarness();
+    // A fresh worktree has no ignored directories on disk yet.
+    let ignoredDirectories = "";
+    const runGitCommand = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === "rev-parse" ? `${REPO_CWD}\n` : ignoredDirectories,
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const service = createService(watcher, {
+      getWorkspaceGitSelfHealPhaseMs: () => 1_000,
+      runGitCommand,
+    });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+
+    await vi.waitFor(() => {
+      expect(getWatcherRecordsForDirectory(watcher, REPO_CWD)).toHaveLength(1);
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+    });
+    const checkoutWatcher = watcher.records.find((record) => record.directory === REPO_CWD);
+    expect(checkoutWatcher?.ignore).not.toContain(path.join(REPO_CWD, "deps"));
+
+    // Dependencies get installed. No .gitignore is touched.
+    ignoredDirectories = "deps/\n";
+    checkoutWatcher?.callback(null, [
+      { path: path.join(REPO_CWD, "deps", "package-a", "index.js"), type: "create" },
+    ]);
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    await vi.waitFor(() => {
+      expect(checkoutWatcher?.updateIgnore).toHaveBeenCalledWith(
+        expect.arrayContaining([path.join(REPO_CWD, "deps")]),
+      );
+    });
+
+    subscription.unsubscribe();
+    service.dispose();
+  });
+
+  test("repeat writes in known directories do not re-run git ls-files", async () => {
+    const watcher = createWatcherHarness();
+    let ignoredDirectories = "";
+    const runGitCommand = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === "rev-parse" ? `${REPO_CWD}\n` : ignoredDirectories,
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const service = createService(watcher, {
+      getWorkspaceGitSelfHealPhaseMs: () => 1_000,
+      runGitCommand,
+    });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await vi.waitFor(() => {
+      expect(getWatcherRecordsForDirectory(watcher, REPO_CWD)).toHaveLength(1);
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+    });
+    const checkoutWatcher = watcher.records.find((record) => record.directory === REPO_CWD);
+    // Registration itself performs one ls-files call to seed the ignore set. Measure the
+    // burst's effect as a delta from this baseline, not an absolute count, so the assertion
+    // cannot pass vacuously off of setup's own call.
+    const lsFilesAtSetup = runGitCommand.mock.calls.filter(
+      (call) => call[0][0] === "ls-files",
+    ).length;
+
+    // One burst in a new directory: one debounced refresh, not one per event.
+    ignoredDirectories = "deps/\n";
+    for (let index = 0; index < 500; index += 1) {
+      checkoutWatcher?.callback(null, [
+        { path: path.join(REPO_CWD, "deps", `module-${index}.js`), type: "create" },
+      ]);
+    }
+    await vi.advanceTimersByTimeAsync(3_000);
+    const lsFilesAfterBurst = runGitCommand.mock.calls.filter(
+      (call) => call[0][0] === "ls-files",
+    ).length;
+    // The burst must have refreshed the ignore set at least once...
+    expect(lsFilesAfterBurst - lsFilesAtSetup).toBeGreaterThanOrEqual(1);
+    // ...but debounced into at most 2 calls, not one per event. (The brief's original absolute
+    // bound was <= 3 total calls with a baseline of 1 from setup, i.e. at most 2 burst-triggered
+    // refreshes — preserve that numeric intent here as a delta.)
+    expect(lsFilesAfterBurst - lsFilesAtSetup).toBeLessThanOrEqual(2);
+
+    // The directory is known now. Further writes trigger nothing.
+    for (let index = 0; index < 200; index += 1) {
+      checkoutWatcher?.callback(null, [
+        { path: path.join(REPO_CWD, "src", `file-${index}.ts`), type: "update" },
+      ]);
+    }
+    await vi.advanceTimersByTimeAsync(3_000);
+    const lsFilesAtEnd = runGitCommand.mock.calls.filter(
+      (call) => call[0][0] === "ls-files",
+    ).length;
+    expect(lsFilesAtEnd).toBeLessThanOrEqual(lsFilesAfterBurst + 1);
+
+    subscription.unsubscribe();
+    service.dispose();
+  });
+
   test("removing an ignored directory updates the watcher without replacement", async () => {
     const watcher = createWatcherHarness();
     let ignoredDirectories = "node_modules/\nbuild/\n";
