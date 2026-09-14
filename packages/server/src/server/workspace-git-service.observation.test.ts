@@ -148,6 +148,50 @@ function getWatcherSubscribeCallCount(
     .length;
 }
 
+// Recovery backoff ladder: base 30s, doubling each attempt, capped at 300s
+// (base * 2 ** 4). Mirrors WATCH_RECOVERY_BASE_DELAY_MS /
+// WATCH_RECOVERY_MAX_BACKOFF_STEPS / WATCH_RECOVERY_MAX_DELAY_MS in
+// workspace-git-service.ts.
+const WATCH_RECOVERY_LADDER_DELAYS_MS = [30_000, 60_000, 120_000, 240_000, 300_000, 300_000];
+
+/**
+ * Drives a watch target (working tree or repository metadata) through six
+ * recovery cycles, proving three things about `advanceWatchRecoveryLadder`:
+ *  - recovery keeps retrying well past the old cap of 3 attempts (this walks
+ *    it to 6, i.e. 7 total subscriptions),
+ *  - the delay between attempts follows 30s/60s/120s/240s and then plateaus
+ *    at 300s rather than growing without bound, and
+ *  - a recovered subscription that emits an event (proving it is live) and
+ *    then errors again immediately — before surviving the 300s durability
+ *    window — does NOT reset the ladder back to the 30s base. Each "advance
+ *    by 30s only" check below would observe a premature retry if a reset had
+ *    happened.
+ */
+async function driveWatchRecoveryLadder(
+  watcher: ReturnType<typeof createWatcherHarness>,
+  directory: string,
+): Promise<void> {
+  for (const [index, delayMs] of WATCH_RECOVERY_LADDER_DELAYS_MS.entries()) {
+    const expectedCallCount = index + 2;
+    if (delayMs > 30_000) {
+      await vi.advanceTimersByTimeAsync(30_000);
+      // Not yet reset to the 30s base: no new attempt after only 30s.
+      expect(getWatcherSubscribeCallCount(watcher, directory)).toBe(expectedCallCount - 1);
+      await vi.advanceTimersByTimeAsync(delayMs - 30_000);
+    } else {
+      await vi.advanceTimersByTimeAsync(delayMs);
+    }
+    await vi.waitFor(() => {
+      expect(getWatcherSubscribeCallCount(watcher, directory)).toBe(expectedCallCount);
+    });
+    const recoveredWatcher = getWatcherRecordsForDirectory(watcher, directory)[index + 1];
+    recoveredWatcher?.callback(null, [
+      { path: path.join(directory, `recovered-${index + 1}.txt`), type: "update" },
+    ]);
+    recoveredWatcher?.callback(new Error(`recovered watcher stopped ${index + 1}`), []);
+  }
+}
+
 function createService(
   watcher: ReturnType<typeof createWatcherHarness>,
   overrides?: Record<string, unknown>,
@@ -1788,7 +1832,7 @@ describe("WorkspaceGitService checkout observation", () => {
     service.dispose();
   });
 
-  test("watcher recovery remains capped when recovered subscriptions emit events before failing", async () => {
+  test("watcher recovery keeps retrying past the old attempt cap and the ladder does not reset on immediate re-failure", async () => {
     const watcher = createWatcherHarness();
     const getCheckoutStatus = vi.fn(async (cwd: string) => createCheckoutStatus(cwd));
     const service = createService(watcher, {
@@ -1803,50 +1847,27 @@ describe("WorkspaceGitService checkout observation", () => {
     const checkoutWatcher = getWatcherRecordsForDirectory(watcher, REPO_CWD)[0];
 
     checkoutWatcher?.callback(new Error("watcher stopped"), []);
-    await vi.advanceTimersByTimeAsync(30_000);
-    await vi.waitFor(() => {
-      expect(getWatcherRecordsForDirectory(watcher, REPO_CWD)).toHaveLength(2);
-    });
-    getWatcherRecordsForDirectory(watcher, REPO_CWD)[1]?.callback(null, [
-      { path: path.join(REPO_CWD, "recovered-1.txt"), type: "update" },
-    ]);
-    getWatcherRecordsForDirectory(watcher, REPO_CWD)[1]?.callback(
-      new Error("recovered watcher stopped"),
-      [],
-    );
-    await vi.advanceTimersByTimeAsync(60_000);
-    await vi.waitFor(() => {
-      expect(getWatcherRecordsForDirectory(watcher, REPO_CWD)).toHaveLength(3);
-    });
-    getWatcherRecordsForDirectory(watcher, REPO_CWD)[2]?.callback(null, [
-      { path: path.join(REPO_CWD, "recovered-2.txt"), type: "update" },
-    ]);
-    getWatcherRecordsForDirectory(watcher, REPO_CWD)[2]?.callback(
-      new Error("recovered watcher stopped again"),
-      [],
-    );
-    await vi.advanceTimersByTimeAsync(120_000);
-    await vi.waitFor(() => {
-      expect(getWatcherSubscribeCallCount(watcher, REPO_CWD)).toBe(4);
-    });
-    getWatcherRecordsForDirectory(watcher, REPO_CWD)[3]?.callback(null, [
-      { path: path.join(REPO_CWD, "recovered-3.txt"), type: "update" },
-    ]);
-    getWatcherRecordsForDirectory(watcher, REPO_CWD)[3]?.callback(
-      new Error("last recovered watcher stopped"),
-      [],
-    );
+    await driveWatchRecoveryLadder(watcher, REPO_CWD);
 
-    const statusCallsAtCap = getCheckoutStatus.mock.calls.length;
+    // Past the old cap of 3 recovery attempts (4 total subscriptions), the
+    // service keeps retrying instead of giving up permanently.
+    expect(getWatcherSubscribeCallCount(watcher, REPO_CWD)).toBe(
+      WATCH_RECOVERY_LADDER_DELAYS_MS.length + 1,
+    );
+    const statusCallsAfterLadder = getCheckoutStatus.mock.calls.length;
     await vi.advanceTimersByTimeAsync(300_000);
-    expect(getWatcherSubscribeCallCount(watcher, REPO_CWD)).toBe(4);
-    expect(getCheckoutStatus.mock.calls.length).toBeGreaterThan(statusCallsAtCap);
+    await vi.waitFor(() => {
+      expect(getWatcherSubscribeCallCount(watcher, REPO_CWD)).toBe(
+        WATCH_RECOVERY_LADDER_DELAYS_MS.length + 2,
+      );
+    });
+    expect(getCheckoutStatus.mock.calls.length).toBeGreaterThan(statusCallsAfterLadder);
 
     subscription.unsubscribe();
     service.dispose();
   });
 
-  test("repository watcher recovery remains capped after recovered subscriptions emit events", async () => {
+  test("repository watcher recovery keeps retrying past the old attempt cap and the ladder does not reset on immediate re-failure", async () => {
     const watcher = createWatcherHarness();
     const getCheckoutStatus = vi.fn(async (cwd: string) => createCheckoutStatus(cwd));
     const service = createService(watcher, {
@@ -1862,21 +1883,21 @@ describe("WorkspaceGitService checkout observation", () => {
       new Error("repository watcher stopped"),
       [],
     );
+    await driveWatchRecoveryLadder(watcher, GIT_DIR);
 
-    for (const [recoveryIndex, delayMs] of [30_000, 60_000, 120_000].entries()) {
-      await vi.advanceTimersByTimeAsync(delayMs);
-      await vi.waitFor(() => {
-        expect(getWatcherRecordsForDirectory(watcher, GIT_DIR)).toHaveLength(recoveryIndex + 2);
-      });
-      const recoveredWatcher = getWatcherRecordsForDirectory(watcher, GIT_DIR)[recoveryIndex + 1];
-      recoveredWatcher?.callback(null, [{ path: path.join(GIT_DIR, "HEAD"), type: "update" }]);
-      recoveredWatcher?.callback(new Error("recovered repository watcher stopped"), []);
-    }
-
-    const statusCallsAtCap = getCheckoutStatus.mock.calls.length;
+    // Past the old cap of 3 recovery attempts (4 total subscriptions), the
+    // service keeps retrying instead of giving up permanently.
+    expect(getWatcherSubscribeCallCount(watcher, GIT_DIR)).toBe(
+      WATCH_RECOVERY_LADDER_DELAYS_MS.length + 1,
+    );
+    const statusCallsAfterLadder = getCheckoutStatus.mock.calls.length;
     await vi.advanceTimersByTimeAsync(300_000);
-    expect(getWatcherSubscribeCallCount(watcher, GIT_DIR)).toBe(4);
-    expect(getCheckoutStatus.mock.calls.length).toBeGreaterThan(statusCallsAtCap);
+    await vi.waitFor(() => {
+      expect(getWatcherSubscribeCallCount(watcher, GIT_DIR)).toBe(
+        WATCH_RECOVERY_LADDER_DELAYS_MS.length + 2,
+      );
+    });
+    expect(getCheckoutStatus.mock.calls.length).toBeGreaterThan(statusCallsAfterLadder);
 
     subscription.unsubscribe();
     service.dispose();
@@ -2112,6 +2133,59 @@ describe("WorkspaceGitService checkout observation", () => {
       (call) => call[0][0] === "ls-files",
     ).length;
     expect(lsFilesAtEnd).toBeLessThanOrEqual(lsFilesAfterBurst + 1);
+
+    subscription.unsubscribe();
+    service.dispose();
+  });
+
+  test("watcher recovery keeps retrying after repeated failures", async () => {
+    // The initial subscribe must succeed so the target starts out healthy; only subscribe
+    // attempts made *after* that (i.e. recovery attempts) should fail. `failDirectories` is
+    // read live on every `subscribe()` call, so mutating it after registration is enough —
+    // no need to fork the harness.
+    const failDirectories = new Set<string>();
+    const watcher = createWatcherHarness({ failDirectories });
+    let ignoredDirectories = "node_modules/\n";
+    const runGitCommand = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === "rev-parse" ? `${REPO_CWD}\n` : ignoredDirectories,
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const service = createService(watcher, {
+      getWorkspaceGitSelfHealPhaseMs: () => 1_000,
+      runGitCommand,
+    });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await vi.waitFor(() => {
+      expect(getWatcherRecordsForDirectory(watcher, REPO_CWD)).toHaveLength(1);
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+    });
+    const checkoutWatcher = watcher.records.find((record) => record.directory === REPO_CWD);
+    const subscribeCallsBeforeFailure = getWatcherSubscribeCallCount(watcher, REPO_CWD);
+
+    // From here on, every further subscribe attempt for this directory fails — a watcher that
+    // cannot be re-established (permission error, unmounted volume, etc).
+    failDirectories.add(REPO_CWD);
+
+    // Force the live subscription to fail and enter recovery. A rejected updateIgnore is the
+    // most direct trigger: it nulls target.subscription and schedules recovery.
+    checkoutWatcher?.updateIgnore.mockRejectedValueOnce(new Error("update failed"));
+    ignoredDirectories = "node_modules/\nbuild/\n";
+    checkoutWatcher?.callback(null, [{ path: path.join(REPO_CWD, ".gitignore"), type: "update" }]);
+
+    // Recovery backs off at WATCH_RECOVERY_BASE_DELAY_MS * 2**(attempt-1) with base 30_000ms,
+    // landing at 30s, 60s, 120s, 240s for the first 4 attempts (WATCH_RECOVERY_MAX_BACKOFF_STEPS
+    // caps the exponent at 4, and WATCH_RECOVERY_MAX_DELAY_MS's 300s ceiling doesn't bind until
+    // the 5th). A 4th recovery attempt needs the first four delays to have elapsed:
+    // 30_000 + 60_000 + 120_000 + 240_000 = 450_000ms. Advance past that with headroom.
+    await vi.advanceTimersByTimeAsync(500_000);
+
+    const subscribeCallsAfterRecoveryWindow = getWatcherSubscribeCallCount(watcher, REPO_CWD);
+    // 1 initial success + 3 capped recovery attempts = 4 total. A 5th call would prove recovery
+    // keeps retrying past the hard cap instead of giving up on this target forever.
+    expect(subscribeCallsAfterRecoveryWindow).toBeGreaterThan(subscribeCallsBeforeFailure + 3);
 
     subscription.unsubscribe();
     service.dispose();

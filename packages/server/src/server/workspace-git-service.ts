@@ -96,7 +96,10 @@ export const WORKSPACE_GIT_REFRESH_CONCURRENCY = 4;
 export const WORKSPACE_GIT_OBSERVATION_SETUP_CONCURRENCY = 2;
 export const WORKSPACE_GIT_WATCHER_SUBSCRIBE_TIMEOUT_MS = 10_000;
 const WATCH_RECOVERY_BASE_DELAY_MS = 30_000;
-const WATCH_RECOVERY_MAX_ATTEMPTS = 3;
+// Giving up permanently leaves polling as the only behaviour until a daemon
+// restart, which kills running agents. Back off, but keep trying.
+const WATCH_RECOVERY_MAX_DELAY_MS = 300_000;
+const WATCH_RECOVERY_MAX_BACKOFF_STEPS = 4;
 // Auxiliary reads may reuse cached values within this window; snapshots do not expire on read.
 const WORKSPACE_GIT_AUXILIARY_READ_TTL_MS = 15_000;
 // Non-forced refresh triggers share this minimum gap to absorb watcher/self-heal bursts; force bypasses it.
@@ -475,6 +478,13 @@ interface WorkingTreeWatchTarget {
 interface WatchRecoveryState {
   attemptCount: number;
   timer: NodeJS.Timeout | null;
+  // Set when a subscription is accepted, cleared when it is scheduled for
+  // recovery. `attemptCount` only resets to 0 once the subscription this
+  // replaces is proven to have survived at least `WATCH_RECOVERY_MAX_DELAY_MS`
+  // — otherwise a filesystem that accepts `subscribe()` but errors on first
+  // use (SMB/NFS, Docker virtiofs, some FUSE) resets the ladder on every
+  // attempt and the backoff never engages.
+  establishedAt: number | null;
 }
 
 function setsEqual(left: ReadonlySet<string>, right: ReadonlySet<string>): boolean {
@@ -1308,7 +1318,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       workspaceKeys: new Set(),
       fallbackPolling: false,
       fallbackPollTimer: null,
-      recovery: { attemptCount: 0, timer: null },
+      recovery: { attemptCount: 0, timer: null, establishedAt: null },
       listeners: new Set(),
       closed: false,
     };
@@ -1482,6 +1492,12 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       }
       target.subscription = subscription;
       target.appliedIgnoreList = ignore;
+      // Do not reset `attemptCount` here — `subscribe()` resolving proves
+      // nothing about the watcher's health on a filesystem where it errors on
+      // first use. Record when this subscription was established instead;
+      // `scheduleWorkingTreeWatchRecovery` only resets the ladder once this
+      // one has survived long enough to prove itself durable.
+      target.recovery.establishedAt = this.deps.now().getTime();
       if (options?.replaceFallback && target.repoRoot !== null) {
         target.fallbackPolling = false;
         if (target.fallbackPollTimer) {
@@ -1572,17 +1588,38 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     this.startWorkingTreeWatchFallback(target, reason);
   }
 
-  private scheduleWorkingTreeWatchRecovery(target: WorkingTreeWatchTarget): void {
+  /**
+   * Advances the recovery backoff ladder and returns the delay to wait
+   * before the next attempt. `attemptCount` only resets to 0 here, and only
+   * when the subscription being replaced was established long enough ago to
+   * have proven itself durable (>= `WATCH_RECOVERY_MAX_DELAY_MS`) — otherwise
+   * a filesystem that accepts `subscribe()` but errors immediately on every
+   * attempt (SMB/NFS, Docker virtiofs, some FUSE) would reset the ladder to 0
+   * on every cycle and the backoff would never engage. Shared by the
+   * working-tree and repo-metadata recovery paths so both apply the same
+   * rule.
+   */
+  private advanceWatchRecoveryLadder(recovery: WatchRecoveryState): number {
     if (
-      target.closed ||
-      target.subscription ||
-      target.recovery.timer ||
-      target.recovery.attemptCount >= WATCH_RECOVERY_MAX_ATTEMPTS
+      recovery.establishedAt !== null &&
+      this.deps.now().getTime() - recovery.establishedAt >= WATCH_RECOVERY_MAX_DELAY_MS
     ) {
+      recovery.attemptCount = 0;
+    }
+    recovery.establishedAt = null;
+    recovery.attemptCount += 1;
+    return Math.min(
+      WATCH_RECOVERY_BASE_DELAY_MS *
+        2 ** Math.min(recovery.attemptCount - 1, WATCH_RECOVERY_MAX_BACKOFF_STEPS),
+      WATCH_RECOVERY_MAX_DELAY_MS,
+    );
+  }
+
+  private scheduleWorkingTreeWatchRecovery(target: WorkingTreeWatchTarget): void {
+    if (target.closed || target.subscription || target.recovery.timer) {
       return;
     }
-    target.recovery.attemptCount += 1;
-    const delayMs = WATCH_RECOVERY_BASE_DELAY_MS * 2 ** (target.recovery.attemptCount - 1);
+    const delayMs = this.advanceWatchRecoveryLadder(target.recovery);
     target.recovery.timer = setTimeout(() => {
       target.recovery.timer = null;
       void this.recoverWorkingTreeWatch(target);
@@ -1941,7 +1978,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       subscription: null,
       fallbackPolling: false,
       fallbackPollTimer: null,
-      recovery: { attemptCount: 0, timer: null },
+      recovery: { attemptCount: 0, timer: null, establishedAt: null },
       intervalId: null,
       fetchInFlight: false,
       bufferedFetchMetadataEvents: [],
@@ -2072,6 +2109,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         return false;
       }
       target.subscription = subscription;
+      // See `advanceWatchRecoveryLadder`: do not reset `attemptCount` on
+      // subscribe success alone, only record when this subscription was
+      // established.
+      target.recovery.establishedAt = this.deps.now().getTime();
       if (options?.replaceFallback) {
         target.fallbackPolling = false;
         if (target.fallbackPollTimer) {
@@ -2112,16 +2153,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   }
 
   private scheduleRepoMetadataWatchRecovery(target: RepoGitTarget): void {
-    if (
-      target.closed ||
-      target.subscription ||
-      target.recovery.timer ||
-      target.recovery.attemptCount >= WATCH_RECOVERY_MAX_ATTEMPTS
-    ) {
+    if (target.closed || target.subscription || target.recovery.timer) {
       return;
     }
-    target.recovery.attemptCount += 1;
-    const delayMs = WATCH_RECOVERY_BASE_DELAY_MS * 2 ** (target.recovery.attemptCount - 1);
+    const delayMs = this.advanceWatchRecoveryLadder(target.recovery);
     target.recovery.timer = setTimeout(() => {
       target.recovery.timer = null;
       void this.recoverRepoMetadataWatch(target);
