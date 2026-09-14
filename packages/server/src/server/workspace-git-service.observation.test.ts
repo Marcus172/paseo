@@ -2235,6 +2235,167 @@ describe("WorkspaceGitService checkout observation", () => {
     service.dispose();
   });
 
+  test("a deleted known directory is dropped, so a later event under it re-runs git ls-files", async () => {
+    // Regression for the finding that `knownDirectories` only ever grows:
+    // nothing previously removed an entry once its directory was deleted
+    // from disk, so a long-lived daemon over a churning tree (deps
+    // installed and removed, build output cycling) would accumulate
+    // tombstones for the life of the target and slow every future
+    // `pruneKnownDirectories` pass. `removeDeletedKnownDirectories` must
+    // drop a directory (and anything nested under it) once a `delete`
+    // event reports the directory path itself — proven here by making a
+    // write reappear under the same path afterward and asserting it costs
+    // a fresh `git ls-files` refresh rather than being silently skipped by
+    // the known-directory fast path.
+    const watcher = createWatcherHarness();
+    const runGitCommand = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === "rev-parse" ? `${REPO_CWD}\n` : "",
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const service = createService(watcher, {
+      getWorkspaceGitSelfHealPhaseMs: () => 1_000,
+      runGitCommand,
+    });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await vi.waitFor(() => {
+      expect(getWatcherRecordsForDirectory(watcher, REPO_CWD)).toHaveLength(1);
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+    });
+    const checkoutWatcher = watcher.records.find((record) => record.directory === REPO_CWD);
+    const lsFilesCallCount = () =>
+      runGitCommand.mock.calls.filter((call) => call[0][0] === "ls-files").length;
+    const lsFilesAtSetup = lsFilesCallCount();
+
+    const depsDir = path.join(REPO_CWD, "deps");
+    // First sight of `deps`: marks it known and schedules one debounced refresh.
+    checkoutWatcher?.callback(null, [{ path: path.join(depsDir, "index.js"), type: "create" }]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => {
+      expect(lsFilesCallCount()).toBeGreaterThan(lsFilesAtSetup);
+    });
+    const lsFilesAfterDepsDiscovery = lsFilesCallCount();
+
+    // A nested directory under `deps` becomes known too. A directory delete
+    // does not guarantee a delete event for everything beneath it, so
+    // removal must drop this along with `deps` itself.
+    const nestedDir = path.join(depsDir, "nested");
+    checkoutWatcher?.callback(null, [{ path: path.join(nestedDir, "index.js"), type: "create" }]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => {
+      expect(lsFilesCallCount()).toBeGreaterThan(lsFilesAfterDepsDiscovery);
+    });
+    const lsFilesAfterNestedDiscovery = lsFilesCallCount();
+
+    // Steady state: another write in a known directory triggers nothing.
+    checkoutWatcher?.callback(null, [{ path: path.join(depsDir, "index2.js"), type: "update" }]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(lsFilesCallCount()).toBe(lsFilesAfterNestedDiscovery);
+
+    // `deps` (the parent) is deleted from disk. The watcher reports the
+    // directory path itself, not just files under it.
+    checkoutWatcher?.callback(null, [{ path: depsDir, type: "delete" }]);
+
+    // A write reappears directly under `deps`. If the delete had not
+    // dropped it from `knownDirectories`, the known-directory fast path
+    // would skip this event and no refresh would run.
+    checkoutWatcher?.callback(null, [
+      { path: path.join(depsDir, "reinstalled.js"), type: "create" },
+    ]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => {
+      expect(lsFilesCallCount()).toBeGreaterThan(lsFilesAfterNestedDiscovery);
+    });
+    const lsFilesAfterDepsRediscovery = lsFilesCallCount();
+
+    // The formerly nested `deps/nested` must have been dropped too, even
+    // though only `deps` itself received a delete event.
+    checkoutWatcher?.callback(null, [
+      { path: path.join(nestedDir, "reinstalled.js"), type: "create" },
+    ]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => {
+      expect(lsFilesCallCount()).toBeGreaterThan(lsFilesAfterDepsRediscovery);
+    });
+
+    subscription.unsubscribe();
+    service.dispose();
+  });
+
+  test("exceeding the known-directories cap clears the set without breaking subsequent refresh behaviour", async () => {
+    // Regression for the finding that `knownDirectories` is the only
+    // unbounded structure in the watcher. `enforceKnownDirectoriesCap` must
+    // clear the whole set outright once it exceeds
+    // `WORKING_TREE_KNOWN_DIRECTORIES_MAX` (50_000) — proven here by
+    // flooding past the cap with directories unrelated to a previously
+    // established "marker" directory, then showing the marker itself lost
+    // its known status too (only a full clear explains that) and that
+    // discovery/refresh keeps working normally afterward.
+    const watcher = createWatcherHarness();
+    const runGitCommand = vi.fn(async (args: string[]) => ({
+      stdout: args[0] === "rev-parse" ? `${REPO_CWD}\n` : "",
+      stderr: "",
+      truncated: false,
+      exitCode: 0,
+      signal: null,
+    }));
+    const service = createService(watcher, {
+      getWorkspaceGitSelfHealPhaseMs: () => 1_000,
+      runGitCommand,
+    });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+    await vi.waitFor(() => {
+      expect(getWatcherRecordsForDirectory(watcher, REPO_CWD)).toHaveLength(1);
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+    });
+    const checkoutWatcher = watcher.records.find((record) => record.directory === REPO_CWD);
+    const lsFilesCallCount = () =>
+      runGitCommand.mock.calls.filter((call) => call[0][0] === "ls-files").length;
+    const lsFilesAtSetup = lsFilesCallCount();
+
+    // Establish one directory as known and steady before the flood.
+    const markerDir = path.join(REPO_CWD, "marker");
+    checkoutWatcher?.callback(null, [{ path: path.join(markerDir, "file.js"), type: "create" }]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => {
+      expect(lsFilesCallCount()).toBeGreaterThan(lsFilesAtSetup);
+    });
+    const lsFilesAfterMarker = lsFilesCallCount();
+
+    // Steady state: another write under the marker directory triggers nothing.
+    checkoutWatcher?.callback(null, [{ path: path.join(markerDir, "file2.js"), type: "update" }]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(lsFilesCallCount()).toBe(lsFilesAfterMarker);
+
+    // Flood past the cap with one batch of brand-new directories, none of
+    // them the marker directory.
+    const floodEvents = Array.from({ length: 50_000 }, (_, index) => ({
+      path: path.join(REPO_CWD, "gen", `d${index}`, "file.js"),
+      type: "create" as const,
+    }));
+    checkoutWatcher?.callback(null, floodEvents);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => {
+      expect(lsFilesCallCount()).toBeGreaterThan(lsFilesAfterMarker);
+    });
+    const lsFilesAfterFlood = lsFilesCallCount();
+
+    // If the cap had not cleared the whole set, the marker directory would
+    // still be known (the flood never touched it) and this write would
+    // trigger nothing. A fresh refresh proves the whole set was wiped, not
+    // selectively trimmed.
+    checkoutWatcher?.callback(null, [{ path: path.join(markerDir, "file3.js"), type: "create" }]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => {
+      expect(lsFilesCallCount()).toBeGreaterThan(lsFilesAfterFlood);
+    });
+
+    subscription.unsubscribe();
+    service.dispose();
+  });
+
   test("watcher recovery keeps retrying after repeated failures", async () => {
     // The initial subscribe must succeed so the target starts out healthy; only subscribe
     // attempts made *after* that (i.e. recovery attempts) should fail. `failDirectories` is

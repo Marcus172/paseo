@@ -90,6 +90,20 @@ const DEGRADED_GIT_POLL_INTERVAL_MS = 5_000;
 // a couple of `git ls-files` runs rather than one per event.
 const WORKING_TREE_IGNORE_REFRESH_QUIET_MS = 300;
 const WORKING_TREE_IGNORE_REFRESH_MAX_DELAY_MS = 2_000;
+// `knownDirectories` is a memoisation of the fast path in
+// `noteWorkingTreeDirectories`, not authoritative state — every entry is
+// rediscoverable from a later watcher event under the same path. Deletion
+// handling (`removeDeletedKnownDirectories`) keeps it close to the live
+// directory count, but this cap is the backstop for what that cannot cover
+// (a missed or coalesced delete event, a backend quirk): clearing the whole
+// set outright on overflow is always safe, since the only cost is one extra
+// `git ls-files` refresh the next time a directory under this root is
+// touched again. Set well below `MAX_TRACKED_ENTRIES` (250_000, the
+// native-recursive.ts cap on combined file+directory entries per watched
+// root) because directories are a minority of any tracked tree, and the
+// observer itself already fails into polling before a single root's
+// combined entry count could approach that cap.
+const WORKING_TREE_KNOWN_DIRECTORIES_MAX = 50_000;
 // Keep whole workspace pipelines below the lower-level Git process pool so daemon control work
 // retains subprocess and event-loop headroom during large workspace reconciliation bursts.
 export const WORKSPACE_GIT_REFRESH_CONCURRENCY = 4;
@@ -463,6 +477,11 @@ interface WorkingTreeWatchTarget {
   appliedIgnoreList: string[];
   ignoredDirectoriesRefreshPromise: Promise<void> | null;
   ignoredDirectoriesRefreshRequested: boolean;
+  // Bounded two ways so a long-lived daemon over a churning tree cannot grow
+  // this without limit: `removeDeletedKnownDirectories` drops an entry (and
+  // anything nested under it) once its own path is reported deleted, and
+  // `enforceKnownDirectoriesCap` clears the whole set outright past
+  // `WORKING_TREE_KNOWN_DIRECTORIES_MAX`. See both for why clearing is safe.
   knownDirectories: Set<string>;
   // Directories added to `knownDirectories` since the last ignore-list
   // refresh that actually completed (successfully or not). A failed refresh
@@ -1690,6 +1709,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     if (target.repoRoot === null) {
       return false;
     }
+    this.removeDeletedKnownDirectories(target, events);
     const gitDir = join(target.watchPath, ".git");
     // `matchesWatchPath` is realpath-aware because it compares an event-reported
     // directory against `target.watchPath` itself — a config-time root that can
@@ -1733,7 +1753,69 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       target.pendingKnownDirectories.add(directory);
       discovered = true;
     }
+    if (discovered) {
+      this.enforceKnownDirectoriesCap(target);
+    }
     return discovered;
+  }
+
+  /**
+   * `knownDirectories` only ever grows in the loop above — nothing
+   * previously dropped an entry once its directory was deleted from disk,
+   * so a long-lived daemon over a tree that creates and deletes directories
+   * (build output, temp dirs, a churning dependency tree) would accumulate
+   * tombstones for the life of the target and slow every future
+   * `pruneKnownDirectories` pass along with it. `FileChange` events arrive
+   * for files too, and a delete of `dir/file.txt` does not mean `dir` is
+   * gone, so this only acts once the deleted path is itself confirmed a
+   * known directory — a cheap `Set.has()` first, so the common case (a file
+   * delete) costs one lookup and returns, same as the fast path this method
+   * feeds into. A directory delete does not guarantee a delete event for
+   * everything beneath it (coalescing, an `rm -rf` of a populated tree), so
+   * once a deleted path is confirmed known, this drops the whole known
+   * subtree the same way `pruneKnownDirectories` drops a newly ignored one —
+   * the deleted path is the containment root here instead of an ignored
+   * root.
+   */
+  private removeDeletedKnownDirectories(
+    target: WorkingTreeWatchTarget,
+    events: FileChange[],
+  ): void {
+    if (target.knownDirectories.size === 0) {
+      return;
+    }
+    for (const event of events) {
+      if (event.type !== "delete" || !target.knownDirectories.has(event.path)) {
+        continue;
+      }
+      for (const directory of target.knownDirectories) {
+        if (!isPathInsideRoot(event.path, directory)) {
+          continue;
+        }
+        target.knownDirectories.delete(directory);
+        // Not required for correctness — both refresh outcomes tolerate a
+        // stale entry that no longer resolves to anything live: a
+        // successful refresh clears `pendingKnownDirectories` outright, and
+        // a failed one's `rearmPendingKnownDirectories` no-ops a delete of
+        // an already-absent key. Dropping it here keeps
+        // `pendingKnownDirectories` a subset of `knownDirectories` at all
+        // times instead of "true except right after a deletion."
+        target.pendingKnownDirectories.delete(directory);
+      }
+    }
+  }
+
+  /**
+   * See `WORKING_TREE_KNOWN_DIRECTORIES_MAX` for why clearing on overflow is
+   * always safe. Runs only when this batch discovered at least one new
+   * directory, since that is the only way `knownDirectories` grows.
+   */
+  private enforceKnownDirectoriesCap(target: WorkingTreeWatchTarget): void {
+    if (target.knownDirectories.size <= WORKING_TREE_KNOWN_DIRECTORIES_MAX) {
+      return;
+    }
+    target.knownDirectories.clear();
+    target.pendingKnownDirectories.clear();
   }
 
   private scheduleWorkingTreeIgnoreRefresh(target: WorkingTreeWatchTarget): void {
