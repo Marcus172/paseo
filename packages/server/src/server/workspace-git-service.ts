@@ -464,6 +464,18 @@ interface WorkingTreeWatchTarget {
   ignoredDirectoriesRefreshPromise: Promise<void> | null;
   ignoredDirectoriesRefreshRequested: boolean;
   knownDirectories: Set<string>;
+  // Directories added to `knownDirectories` since the last ignore-list
+  // refresh that actually completed (successfully or not). A failed refresh
+  // (`loadIgnoredDirs` falling back to the previous set) must not leave a
+  // newly seen directory permanently marked known — that would silently
+  // reintroduce the original "watched forever" bug through the failure path.
+  // `replaceWorkingTreeIgnoredDirectories` rolls this set back into
+  // `knownDirectories` on failure so a later event under the same directory
+  // is treated as unseen again and re-arms the refresh; on success it is
+  // simply cleared, since a successful refresh reflects the full current
+  // ignore state and `pruneKnownDirectories` already removes anything that
+  // turned out to be ignored.
+  pendingKnownDirectories: Set<string>;
   ignoreRefreshTimer: NodeJS.Timeout | null;
   ignoreRefreshDeadlineMs: number | null;
   aliases: Set<string>;
@@ -1301,7 +1313,9 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     watchPath: string,
     repoRoot: string | null,
   ): Promise<WorkingTreeWatchTarget> {
-    const ignoredDirectories = repoRoot ? await this.loadIgnoredDirs(watchPath) : new Set<string>();
+    const ignoredDirectories = repoRoot
+      ? (await this.loadIgnoredDirs(watchPath)).ignored
+      : new Set<string>();
     const target: WorkingTreeWatchTarget = {
       cwd,
       watchPath,
@@ -1312,6 +1326,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
       ignoredDirectoriesRefreshPromise: null,
       ignoredDirectoriesRefreshRequested: false,
       knownDirectories: new Set(),
+      pendingKnownDirectories: new Set(),
       ignoreRefreshTimer: null,
       ignoreRefreshDeadlineMs: null,
       aliases: new Set([cwd]),
@@ -1715,6 +1730,7 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         continue;
       }
       target.knownDirectories.add(directory);
+      target.pendingKnownDirectories.add(directory);
       discovered = true;
     }
     return discovered;
@@ -1784,6 +1800,27 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
     }
   }
 
+  /**
+   * Undoes the "mark known" side effect of `noteWorkingTreeDirectories` for
+   * every directory discovered since the last refresh that actually
+   * completed, because this refresh did not — it fell back to the previous
+   * ignore set (see `loadIgnoredDirs`). Leaving them in `knownDirectories`
+   * would make the steady-state Set-lookup fast path in
+   * `noteWorkingTreeDirectories` skip them forever, even though this refresh
+   * never determined whether they are ignored. Removing them here re-arms
+   * discovery: the next event under any of them is treated as unseen again,
+   * so `noteWorkingTreeDirectories` schedules another refresh attempt.
+   */
+  private rearmPendingKnownDirectories(target: WorkingTreeWatchTarget): void {
+    if (target.pendingKnownDirectories.size === 0) {
+      return;
+    }
+    for (const directory of target.pendingKnownDirectories) {
+      target.knownDirectories.delete(directory);
+    }
+    target.pendingKnownDirectories.clear();
+  }
+
   private hasRelevantWorkingTreeEvent(
     target: WorkingTreeWatchTarget,
     events: FileChange[],
@@ -1841,12 +1878,22 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
   private async replaceWorkingTreeIgnoredDirectories(
     target: WorkingTreeWatchTarget,
   ): Promise<void> {
-    const ignoredDirectories = await this.loadIgnoredDirs(
+    const { ignored: ignoredDirectories, failed } = await this.loadIgnoredDirs(
       target.watchPath,
       target.ignoredDirectories,
     );
     if (target.closed) {
       return;
+    }
+    if (failed) {
+      // A failed `git ls-files` must not leave directories discovered since
+      // the last completed refresh permanently marked known — see the
+      // `pendingKnownDirectories` field comment. Re-arm them so the next
+      // event under any of them is treated as unseen again and schedules
+      // another refresh attempt.
+      this.rearmPendingKnownDirectories(target);
+    } else {
+      target.pendingKnownDirectories.clear();
     }
     if (!this.haveSamePaths(target.ignoredDirectories, ignoredDirectories)) {
       target.ignoredDirectories = ignoredDirectories;
@@ -2787,11 +2834,17 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
    * every directory that was previously ignored. Returning the previous set
    * instead means a failed refresh leaves the watcher's ignore state
    * unchanged rather than un-ignoring the entire dependency tree.
+   *
+   * `failed` lets the caller distinguish "ran fresh and happened to match
+   * `previous`" from "the git command itself failed" — the two are
+   * indistinguishable by comparing sets alone, but `replaceWorkingTreeIgnoredDirectories`
+   * needs to know which one happened to decide whether directories newly
+   * marked known since the last refresh can be trusted or must be re-armed.
    */
   private async loadIgnoredDirs(
     rootPath: string,
     previous: Set<string> = new Set(),
-  ): Promise<Set<string>> {
+  ): Promise<{ ignored: Set<string>; failed: boolean }> {
     const ignored = new Set<string>();
     try {
       const result = await this.deps.runGitCommand(
@@ -2813,10 +2866,10 @@ export class WorkspaceGitServiceImpl implements WorkspaceGitService {
         { err: error, rootPath },
         "Failed to load gitignore directories; keeping previous ignore set",
       );
-      return previous;
+      return { ignored: previous, failed: true };
     }
 
-    return ignored;
+    return { ignored, failed: false };
   }
 
   private async refreshWorkspaceTarget(

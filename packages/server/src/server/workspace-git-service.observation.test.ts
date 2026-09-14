@@ -2016,10 +2016,31 @@ describe("WorkspaceGitService checkout observation", () => {
     // logic itself instead of relying on host filesystem behavior.
     //
     // Driven directly against the private target rather than through
-    // `registerWorkspace`, because `registerWorkspace` runs `cwd` through
-    // `node:path`'s `resolve()`, which on this POSIX test host rewrites a
-    // drive-letter path into an ordinary POSIX one and destroys the shape
-    // this test depends on.
+    // `registerWorkspace`, for two independent reasons, both checked before
+    // settling on this shape:
+    //
+    // 1. Reachability: `registerWorkspace` resolves `cwd` through
+    //    `node:path`'s `resolve()` before anything else runs, and on this
+    //    POSIX test host that rewrites a drive-letter path into an ordinary
+    //    POSIX one, destroying the shape this test depends on. This step can
+    //    be routed around — mocking `git rev-parse --show-toplevel`'s stdout
+    //    lets `target.watchPath` carry the raw Windows-shaped string, since
+    //    `parseGitRevParsePath` does not call `resolve()` — but
+    //    `loadIgnoredDirs` then calls `resolve(rootPath, rel)` on that same
+    //    watch path to build `ignoredDirectories`, which on POSIX prefixes it
+    //    with `process.cwd()` and breaks the shared prefix the fold logic
+    //    compares against. Two independent `resolve()` calls, each assuming
+    //    host-platform semantics, block the public path from both sides.
+    // 2. Observability: even granting reachability, `knownDirectories` has
+    //    exactly one reader outside this method — the Set-lookup fast path in
+    //    `noteWorkingTreeDirectories` — and that method's fallback branch
+    //    re-derives ignored-ness via `isPathInsideRoot`, which already folds
+    //    case correctly on its own. Verified by deleting this method's fold
+    //    logic (forcing `foldCase = false`) and running this file plus the
+    //    integration suite: only this test failed. No public-surface
+    //    assertion distinguishes a correctly pruned directory from one left
+    //    stale, because the redundant check downstream produces the same
+    //    outcome either way.
     const service = createService(createWatcherHarness());
     const target = {
       watchPath: "C:/Users/dev/Repo",
@@ -2068,6 +2089,82 @@ describe("WorkspaceGitService checkout observation", () => {
     await vi.advanceTimersByTimeAsync(2_000);
 
     await vi.waitFor(() => {
+      expect(checkoutWatcher?.updateIgnore).toHaveBeenCalledWith(
+        expect.arrayContaining([path.join(REPO_CWD, "deps")]),
+      );
+    });
+
+    subscription.unsubscribe();
+    service.dispose();
+  });
+
+  test("a failed ignore refresh does not permanently mark a directory known", async () => {
+    // Regression for the failure path reintroducing the original #4558 bug:
+    // `noteWorkingTreeDirectories` marks a newly seen directory known and
+    // schedules a debounced refresh, but `loadIgnoredDirs` deliberately keeps
+    // the previous ignore set when `git ls-files` fails (a transient failure
+    // must not un-ignore the whole dependency tree). If that success/failure
+    // distinction is not carried back, the directory stays "known" forever
+    // with the fast-path Set lookup in `noteWorkingTreeDirectories` skipping
+    // it on every later event — so no refresh is ever attempted again and
+    // the directory is watched forever, same as before #4558 was fixed.
+    const watcher = createWatcherHarness();
+    let ignoredDirectories = "";
+    let lsFilesCallCount = 0;
+    const runGitCommand = vi.fn(async (args: string[]) => {
+      if (args[0] === "rev-parse") {
+        return { stdout: `${REPO_CWD}\n`, stderr: "", truncated: false, exitCode: 0, signal: null };
+      }
+      lsFilesCallCount += 1;
+      // The seed load at registration (call 1) succeeds. The refresh
+      // triggered by the newly discovered "deps" directory (call 2) fails
+      // transiently.
+      if (lsFilesCallCount === 2) {
+        throw new Error("git ls-files timed out");
+      }
+      return {
+        stdout: ignoredDirectories,
+        stderr: "",
+        truncated: false,
+        exitCode: 0,
+        signal: null,
+      };
+    });
+    const service = createService(watcher, {
+      getWorkspaceGitSelfHealPhaseMs: () => 1_000,
+      runGitCommand,
+    });
+    const subscription = service.registerWorkspace({ cwd: REPO_CWD }, vi.fn());
+
+    await vi.waitFor(() => {
+      expect(getWatcherRecordsForDirectory(watcher, REPO_CWD)).toHaveLength(1);
+      expect(service.getMetrics().workspaceObservationSetupInFlightCount).toBe(0);
+    });
+    const checkoutWatcher = watcher.records.find((record) => record.directory === REPO_CWD);
+    expect(lsFilesCallCount).toBe(1);
+
+    // Dependencies get installed. No .gitignore is touched, so this only
+    // schedules a refresh via directory discovery — the one wired to fail.
+    ignoredDirectories = "deps/\n";
+    checkoutWatcher?.callback(null, [
+      { path: path.join(REPO_CWD, "deps", "package-a", "index.js"), type: "create" },
+    ]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => {
+      expect(lsFilesCallCount).toBe(2);
+    });
+    // The failed refresh must not have applied "deps" to the live watcher.
+    expect(checkoutWatcher?.updateIgnore).not.toHaveBeenCalled();
+
+    // A later write under the same directory. If the directory were left
+    // permanently "known" by the failed refresh, `noteWorkingTreeDirectories`
+    // would silently skip it here and no second refresh would ever happen.
+    checkoutWatcher?.callback(null, [
+      { path: path.join(REPO_CWD, "deps", "package-a", "index2.js"), type: "create" },
+    ]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => {
+      expect(lsFilesCallCount).toBe(3);
       expect(checkoutWatcher?.updateIgnore).toHaveBeenCalledWith(
         expect.arrayContaining([path.join(REPO_CWD, "deps")]),
       );
