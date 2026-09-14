@@ -239,3 +239,152 @@ test("a classification shed onto the scoped audit still recovers the file", asyn
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// C1 regression: removeSubtree unlinks its root from the parent's
+// DirectoryEntry as part of tearing down the old subtree. reconcileSubtree
+// re-populates the index below `directory` via mergeInventory but must also
+// re-link `directory` itself back into its parent -- walkSubtree only
+// descends through that link, so without the re-link a later ancestor
+// removal can no longer reach anything below the reconciled directory.
+test("a recursive-scope reconcile re-links its directory so an ancestor removal still finds nested files", async () => {
+  const root = await mkdtemp(join(tmpdir(), "native-relink-"));
+  const paths = createObserverPaths(process.platform);
+  const deepDirectory = join(root, "a", "b", "c");
+  const deepFile = join(deepDirectory, "deep.txt");
+  await mkdir(deepDirectory, { recursive: true });
+  await writeFile(deepFile, "content");
+  const events: FileChange[] = [];
+  const notifications = new EventEmitter();
+  const observer = createFileObserver();
+  let active = true;
+  const backend = createNativeRecursiveBackend(
+    {
+      root,
+      metrics: observer.getDiagnostics(),
+      isActive: () => active,
+      isIgnored: () => false,
+      isPathInside: paths.isInside,
+      queueEvent: (type, path) => events.push({ type, path }),
+      fail: (error) => {
+        throw error;
+      },
+    },
+    paths,
+    (_root, listener) => {
+      notifications.on("change", listener);
+      return {
+        close: () => notifications.removeAllListeners(),
+        on: (event, onError) => notifications.on(event, onError),
+      };
+    },
+  );
+  const settled = () =>
+    expect
+      .poll(
+        () => {
+          const diagnostics = backend.getDiagnostics();
+          return (
+            diagnostics.pendingReconciliationWorkCount === 0 && !diagnostics.reconciliationInFlight
+          );
+        },
+        { timeout: 10_000 },
+      )
+      .toBe(true);
+  try {
+    await backend.start(); // Tracks a, a/b, a/b/c, and deep.txt.
+
+    // A rename event landing on the already-known directory a/b produces a
+    // local scope on its parent "a" (rebuilding a's DirectoryEntry from a
+    // fresh shallow scan) and, once classify()'s real stat() confirms a/b is
+    // still a directory, a recursive scope on a/b itself -- the same "known
+    // directory changes in place" shape the directory-churn benchmark
+    // exercises via atomic replace.
+    notifications.emit("change", "rename", join(root, "a", "b"));
+    await settled();
+
+    // Now remove the ancestor "a" outright. Its parent (root) notices "a"
+    // missing from a fresh shallow scan and calls removeSubtree("a", true).
+    await rm(join(root, "a"), { recursive: true, force: true });
+    notifications.emit("change", "rename", join(root, "a"));
+    await settled();
+
+    expect(events.filter((event) => event.type === "delete").map((event) => event.path)).toContain(
+      deepFile,
+    );
+  } finally {
+    active = false;
+    await backend.close();
+    await observer.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// I2 regression: startClassification queues an unconditional "create" event
+// before onPresent runs. When a file's parent directory has no entries
+// bucket yet (a coalesced directory-creation event that never arrived),
+// declining to track the path at all announces a create it can never
+// retract -- no future scan can rediscover a path that is already gone from
+// disk to emit its matching delete.
+test("a file classified with no parent bucket yet still gets its delete emitted", async () => {
+  const root = await mkdtemp(join(tmpdir(), "native-orphan-"));
+  const paths = createObserverPaths(process.platform);
+  const newDirectory = join(root, "newdir");
+  const events: FileChange[] = [];
+  const notifications = new EventEmitter();
+  const observer = createFileObserver();
+  let active = true;
+  const backend = createNativeRecursiveBackend(
+    {
+      root,
+      metrics: observer.getDiagnostics(),
+      isActive: () => active,
+      isIgnored: () => false,
+      isPathInside: paths.isInside,
+      queueEvent: (type, path) => events.push({ type, path }),
+      fail: (error) => {
+        throw error;
+      },
+    },
+    paths,
+    (_root, listener) => {
+      notifications.on("change", listener);
+      return {
+        close: () => notifications.removeAllListeners(),
+        on: (event, onError) => notifications.on(event, onError),
+      };
+    },
+  );
+  try {
+    await backend.start(); // Tracks the (empty) root only.
+
+    // A brand-new directory with no directory-created event processed for
+    // it yet (coalesced away) has no entries bucket: entries.get(scope) is
+    // undefined for a file inside it.
+    await mkdir(newDirectory);
+    const filePath = join(newDirectory, "orphan.txt");
+    await writeFile(filePath, "content");
+    notifications.emit("change", "rename", filePath);
+
+    // The file must stay tracked so a later removal can still find and
+    // retract the create that startClassification already queued.
+    await expect.poll(() => backend.getDiagnostics().nativeTrackedFileCount).toBe(1);
+    expect(events.some((event) => event.type === "create" && event.path === filePath)).toBe(true);
+
+    // Remove the whole directory before any audit ever scans it. Nothing
+    // will see filePath as "on disk and gone from a known listing" through
+    // the normal directory-scan diff, since newdir never had one.
+    await rm(newDirectory, { recursive: true, force: true });
+
+    await expect
+      .poll(() => events.some((event) => event.type === "delete" && event.path === filePath), {
+        timeout: 10_000,
+      })
+      .toBe(true);
+    expect(backend.getDiagnostics().nativeTrackedFileCount).toBe(0);
+  } finally {
+    active = false;
+    await backend.close();
+    await observer.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
